@@ -2,16 +2,16 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #include "swift/IDE/Utils.h"
-#include "swift/Basic/Fallthrough.h"
+#include "swift/Basic/Edit.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Frontend/Frontend.h"
@@ -19,11 +19,15 @@
 #include "swift/Subsystems.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclObjC.h"
+#include "clang/Basic/TargetInfo.h"
 #include "clang/CodeGen/ObjectFilePCHContainerOperations.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/TextDiagnosticBuffer.h"
+#include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Serialization/ASTReader.h"
+#include "clang/Rewrite/Core/RewriteBuffer.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 
@@ -42,15 +46,15 @@ static const char *skipParenExpression(const char *p, const char *End) {
       case ')':
         done = --ParenCount == 0;
         break;
-                  
+
       case '(':
         ++ParenCount;
         break;
-              
+
       case '"':
         e = skipStringInCode (e, End);
         break;
-              
+
       default:
         break;
       }
@@ -73,7 +77,7 @@ static const char *skipStringInCode(const char *p, const char *End) {
       case '"':
         done = true;
         break;
-                  
+
       case '\\':
         ++e;
         if (e >= End)
@@ -81,7 +85,7 @@ static const char *skipStringInCode(const char *p, const char *End) {
         else if (*e == '(')
           e = skipParenExpression (e, End);
         break;
-              
+
       default:
         break;
       }
@@ -96,22 +100,16 @@ static const char *skipStringInCode(const char *p, const char *End) {
 }
 
 SourceCompleteResult
-ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf) {
+ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf,
+                           SourceFileKind SFKind) {
   SourceManager SM;
   auto BufferID = SM.addNewSourceBuffer(std::move(MemBuf));
-  ParserUnit Parse(SM, BufferID);
-  Parser &P = Parse.getParser();
-
-  bool Done;
-  do {
-    P.parseTopLevel();
-    Done = P.Tok.is(tok::eof);
-  } while (!Done);
-
+  ParserUnit Parse(SM, SFKind, BufferID);
+  Parse.parse();
   SourceCompleteResult SCR;
-  SCR.IsComplete = !P.isInputIncomplete();
-    
-  // Use the same code that was in the REPL code to track the indent level 
+  SCR.IsComplete = !Parse.getParser().isInputIncomplete();
+
+  // Use the same code that was in the REPL code to track the indent level
   // for now. In the future we should get this from the Parser if possible.
 
   CharSourceRange entireRange = SM.getRangeForBuffer(BufferID);
@@ -119,7 +117,7 @@ ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf) {
   const char *SourceStart = Buffer.data();
   const char *SourceEnd = Buffer.data() + Buffer.size();
   const char *LineStart = SourceStart;
-  const char *LineSourceStart = NULL;
+  const char *LineSourceStart = nullptr;
   uint32_t LineIndent = 0;
   struct IndentInfo {
     StringRef Prefix;
@@ -134,7 +132,7 @@ ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf) {
     case '\r':
     case '\n':
       LineIndent = 0;
-      LineSourceStart = NULL;
+      LineSourceStart = nullptr;
       LineStart = p + 1;
       break;
 
@@ -146,7 +144,7 @@ ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf) {
     case '(':
     case '[':
       ++LineIndent;
-      if (LineSourceStart == NULL)
+      if (LineSourceStart == nullptr)
         IndentInfos.push_back(IndentInfo(LineStart,
                                          p - LineStart,
                                          LineIndent));
@@ -164,9 +162,9 @@ ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf) {
       if (!IndentInfos.empty())
         IndentInfos.pop_back();
       break;
-  
+
     default:
-      if (LineSourceStart == NULL && !isspace(*p))
+      if (LineSourceStart == nullptr && !isspace(*p))
         LineSourceStart = p;
       break;
     }
@@ -174,7 +172,7 @@ ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf) {
       break;
   }
   if (!IndentInfos.empty()) {
-    SCR.IndentPrefix = std::move(IndentInfos.back().Prefix.str());
+    SCR.IndentPrefix = IndentInfos.back().Prefix.str();
     // Trim off anything that follows a non-space character
     const size_t pos = SCR.IndentPrefix.find_first_not_of(" \t");
     if (pos != std::string::npos)
@@ -184,12 +182,14 @@ ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf) {
   return SCR;
 }
 
-SourceCompleteResult ide::isSourceInputComplete(StringRef Text) {
-  return ide::isSourceInputComplete(llvm::MemoryBuffer::getMemBufferCopy(Text));
+SourceCompleteResult
+ide::isSourceInputComplete(StringRef Text,SourceFileKind SFKind) {
+  return ide::isSourceInputComplete(llvm::MemoryBuffer::getMemBufferCopy(Text),
+                                    SFKind);
 }
 
 // Adjust the cc1 triple string we got from clang, to make sure it will be
-// accepted when it goes throught the swift clang importer.
+// accepted when it goes through the swift clang importer.
 static std::string adjustClangTriple(StringRef TripleStr) {
   std::string Result;
   llvm::raw_string_ostream OS(Result);
@@ -202,6 +202,14 @@ static std::string adjustClangTriple(StringRef TripleStr) {
     OS << "armv7s"; break;
   case llvm::Triple::SubArchType::ARMSubArch_v7k:
     OS << "armv7k"; break;
+  case llvm::Triple::SubArchType::ARMSubArch_v6:
+    OS << "armv6"; break;
+  case llvm::Triple::SubArchType::ARMSubArch_v6m:
+    OS << "armv6m"; break;
+  case llvm::Triple::SubArchType::ARMSubArch_v6k:
+    OS << "armv6k"; break;
+  case llvm::Triple::SubArchType::ARMSubArch_v6t2:
+    OS << "armv6t2"; break;
   default:
     // Adjust i386-macosx to x86_64 because there is no Swift stdlib for i386.
     if ((Triple.getOS() == llvm::Triple::MacOSX ||
@@ -212,7 +220,8 @@ static std::string adjustClangTriple(StringRef TripleStr) {
     }
     break;
   }
-  OS << '-' << Triple.getVendorName() << '-' << Triple.getOSName();
+  OS << '-' << Triple.getVendorName() << '-' <<
+      Triple.getOSAndEnvironmentName();
   OS.flush();
   return Result;
 }
@@ -230,10 +239,15 @@ bool ide::initInvocationByClangArguments(ArrayRef<const char *> ArgList,
                                                &DiagBuf,
                                                /*ShouldOwnClient=*/false);
 
+  // Clang expects this to be like an actual command line. So we need to pass in
+  // "clang" for argv[0].
+  std::vector<const char *> ClangArgList;
+  ClangArgList.push_back("clang");
+  ClangArgList.insert(ClangArgList.end(), ArgList.begin(), ArgList.end());
+
   // Create a new Clang compiler invocation.
-  llvm::IntrusiveRefCntPtr<clang::CompilerInvocation> ClangInvok{
-    clang::createInvocationFromCommandLine(ArgList, ClangDiags)
-  };
+  std::unique_ptr<clang::CompilerInvocation> ClangInvok =
+      clang::createInvocationFromCommandLine(ClangArgList, ClangDiags);
   if (!ClangInvok || ClangDiags->hasErrorOccurred()) {
     for (auto I = DiagBuf.err_begin(), E = DiagBuf.err_end(); I != E; ++I) {
       Error += I->second;
@@ -270,7 +284,7 @@ bool ide::initInvocationByClangArguments(ArrayRef<const char *> ArgList,
         break;
       case clang::frontend::IndexHeaderMap:
         CCArgs.push_back("-index-header-map");
-        SWIFT_FALLTHROUGH;
+        LLVM_FALLTHROUGH;
       case clang::frontend::Angled: {
         std::string Flag;
         if (Entry.IsFramework)
@@ -327,11 +341,12 @@ bool ide::initInvocationByClangArguments(ArrayRef<const char *> ArgList,
     CCArgs.push_back(Entry);
   }
 
-  if (!ClangInvok->getLangOpts()->ImplementationOfModule.empty()) {
+  if (!ClangInvok->getLangOpts()->isCompilingModule()) {
     CCArgs.push_back("-Xclang");
-    CCArgs.push_back("-fmodule-implementation-of");
-    CCArgs.push_back("-Xclang");
-    CCArgs.push_back(ClangInvok->getLangOpts()->ImplementationOfModule);
+    llvm::SmallString<64> Str;
+    Str += "-fmodule-name=";
+    Str += ClangInvok->getLangOpts()->CurrentModule;
+    CCArgs.push_back(std::string(Str.str()));
   }
 
   if (PPOpts.DetailedRecord) {
@@ -340,7 +355,7 @@ bool ide::initInvocationByClangArguments(ArrayRef<const char *> ArgList,
 
   if (!ClangInvok->getFrontendOpts().Inputs.empty()) {
     Invok.getFrontendOptions().ImplicitObjCHeaderPath =
-      ClangInvok->getFrontendOpts().Inputs[0].getFile();
+        ClangInvok->getFrontendOpts().Inputs[0].getFile().str();
   }
 
   return false;
@@ -358,7 +373,7 @@ static void walkOverriddenClangDecls(const clang::NamedDecl *D, const FnTy &Fn){
 
 void
 ide::walkOverriddenDecls(const ValueDecl *VD,
-                         std::function<void(llvm::PointerUnion<
+                         llvm::function_ref<void(llvm::PointerUnion<
                              const ValueDecl*, const clang::NamedDecl*>)> Fn) {
   for (auto CurrOver = VD; CurrOver; CurrOver = CurrOver->getOverriddenDecl()) {
     if (CurrOver != VD)
@@ -432,7 +447,7 @@ ide::replacePlaceholders(std::unique_ptr<llvm::MemoryBuffer> InputBuf,
     assert(Id.size() == Occur.FullPlaceholder.size());
 
     unsigned Offset = Occur.FullPlaceholder.data() - InputBuf->getBufferStart();
-    char *Ptr = (char*)NewBuf->getBufferStart() + Offset;
+    char *Ptr = const_cast<char *>(NewBuf->getBufferStart()) + Offset;
     std::copy(Id.begin(), Id.end(), Ptr);
 
     Occur.IdentifierReplacement = Id.str();
@@ -467,7 +482,7 @@ ide::replacePlaceholders(std::unique_ptr<llvm::MemoryBuffer> InputBuf,
 static std::string getPlistEntry(const llvm::Twine &Path, StringRef KeyName) {
   auto BufOrErr = llvm::MemoryBuffer::getFile(Path);
   if (!BufOrErr) {
-    llvm::errs() << BufOrErr.getError().message() << '\n';
+    llvm::errs() << "could not open '" << Path << "': " << BufOrErr.getError().message() << '\n';
     return {};
   }
 
@@ -483,7 +498,7 @@ static std::string getPlistEntry(const llvm::Twine &Path, StringRef KeyName) {
       std::tie(CurLine, Lines) = Lines.split('\n');
       unsigned Begin = CurLine.find("<string>") + strlen("<string>");
       unsigned End = CurLine.find("</string>");
-      return CurLine.substr(Begin, End-Begin);
+      return CurLine.substr(Begin, End - Begin).str();
     }
   }
 
@@ -494,7 +509,7 @@ std::string ide::getSDKName(StringRef Path) {
   std::string Name = getPlistEntry(llvm::Twine(Path)+"/SDKSettings.plist",
                                    "CanonicalName");
   if (Name.empty() && Path.endswith(".sdk")) {
-    Name = llvm::sys::path::filename(Path).drop_back(strlen(".sdk"));
+    Name = llvm::sys::path::filename(Path).drop_back(strlen(".sdk")).str();
   }
   return Name;
 }
@@ -764,3 +779,234 @@ void ide::collectModuleNames(StringRef SDKPath,
   }
 }
 
+DeclNameViewer::DeclNameViewer(StringRef Text): IsValid(true), HasParen(false) {
+  auto ArgStart = Text.find_first_of('(');
+  if (ArgStart == StringRef::npos) {
+    BaseName = Text;
+    return;
+  }
+  HasParen = true;
+  BaseName = Text.substr(0, ArgStart);
+  auto ArgEnd = Text.find_last_of(')');
+  if (ArgEnd == StringRef::npos) {
+    IsValid = false;
+    return;
+  }
+  StringRef AllArgs = Text.substr(ArgStart + 1, ArgEnd - ArgStart - 1);
+  AllArgs.split(Labels, ":");
+  if (Labels.empty())
+    return;
+  if ((IsValid = Labels.back().empty())) {
+    Labels.pop_back();
+    std::transform(Labels.begin(), Labels.end(), Labels.begin(),
+        [](StringRef Label) {
+      return Label == "_" ? StringRef() : Label;
+    });
+  }
+}
+
+unsigned DeclNameViewer::commonPartsCount(DeclNameViewer &Other) const {
+  if (base() != Other.base())
+    return 0;
+  unsigned Result = 1;
+  unsigned Len = std::min(args().size(), Other.args().size());
+  for (unsigned I = 0; I < Len; ++ I) {
+    if (args()[I] == Other.args()[I])
+      ++Result;
+    else
+      return Result;
+  }
+  return Result;
+}
+
+void swift::ide::SourceEditConsumer::
+accept(SourceManager &SM, SourceLoc Loc, StringRef Text,
+       ArrayRef<NoteRegion> SubRegions) {
+  accept(SM, CharSourceRange(Loc, 0), Text, SubRegions);
+}
+
+void swift::ide::SourceEditConsumer::
+accept(SourceManager &SM, CharSourceRange Range, StringRef Text,
+       ArrayRef<NoteRegion> SubRegions) {
+  accept(SM, RegionType::ActiveCode, {{Range, Text, SubRegions}});
+}
+
+void swift::ide::SourceEditConsumer::
+insertAfter(SourceManager &SM, SourceLoc Loc, StringRef Text,
+            ArrayRef<NoteRegion> SubRegions) {
+  accept(SM, Lexer::getLocForEndOfToken(SM, Loc), Text, SubRegions);
+}
+
+void swift::ide::SourceEditConsumer::
+remove(SourceManager &SM, CharSourceRange Range) {
+  accept(SM, Range, "");
+}
+
+struct swift::ide::SourceEditJsonConsumer::Implementation {
+  llvm::raw_ostream &OS;
+  std::vector<SingleEdit> AllEdits;
+  Implementation(llvm::raw_ostream &OS) : OS(OS) {}
+  ~Implementation() {
+    writeEditsInJson(AllEdits, OS);
+  }
+  void accept(SourceManager &SM, CharSourceRange Range,
+              llvm::StringRef Text) {
+    AllEdits.push_back({SM, Range, Text.str()});
+  }
+};
+
+swift::ide::SourceEditJsonConsumer::SourceEditJsonConsumer(llvm::raw_ostream &OS) :
+  Impl(*new Implementation(OS)) {}
+
+swift::ide::SourceEditJsonConsumer::~SourceEditJsonConsumer() { delete &Impl; }
+
+void swift::ide::SourceEditJsonConsumer::
+accept(SourceManager &SM, RegionType Type, ArrayRef<Replacement> Replacements) {
+  for (const auto &Replacement: Replacements) {
+    Impl.accept(SM, Replacement.Range, Replacement.Text);
+  }
+}
+namespace {
+class ClangFileRewriterHelper {
+  unsigned InterestedId;
+  clang::RewriteBuffer RewriteBuf;
+  bool HasChange;
+  llvm::raw_ostream &OS;
+
+  void removeCommentLines(clang::RewriteBuffer &Buffer, StringRef Input,
+                          StringRef LineHeader) {
+    size_t Pos = 0;
+    while (true) {
+      Pos = Input.find(LineHeader, Pos);
+      if (Pos == StringRef::npos)
+        break;
+      Pos = Input.substr(0, Pos).rfind("//");
+      assert(Pos != StringRef::npos);
+      size_t EndLine = Input.find('\n', Pos);
+      assert(EndLine != StringRef::npos);
+      ++EndLine;
+      Buffer.RemoveText(Pos, EndLine-Pos);
+      Pos = EndLine;
+    }
+  }
+
+public:
+  ClangFileRewriterHelper(SourceManager &SM, unsigned InterestedId,
+                          llvm::raw_ostream &OS)
+  : InterestedId(InterestedId), HasChange(false), OS(OS) {
+    StringRef Input(SM.getLLVMSourceMgr().getMemoryBuffer(InterestedId)->
+                    getBuffer());
+    RewriteBuf.Initialize(Input);
+    removeCommentLines(RewriteBuf, Input, "RUN");
+    removeCommentLines(RewriteBuf, Input, "CHECK");
+  }
+
+  void replaceText(SourceManager &SM, CharSourceRange Range, StringRef Text) {
+    auto BufferId = SM.findBufferContainingLoc(Range.getStart());
+    if (BufferId == InterestedId) {
+      HasChange = true;
+      auto StartLoc = SM.getLocOffsetInBuffer(Range.getStart(), BufferId);
+      if (!Range.getByteLength())
+          RewriteBuf.InsertText(StartLoc, Text);
+      else
+          RewriteBuf.ReplaceText(StartLoc, Range.str().size(), Text);
+    }
+  }
+
+  ~ClangFileRewriterHelper() {
+    if (HasChange)
+      RewriteBuf.write(OS);
+  }
+};
+} // end anonymous namespace
+struct swift::ide::SourceEditOutputConsumer::Implementation {
+  ClangFileRewriterHelper Rewriter;
+  Implementation(SourceManager &SM, unsigned BufferId, llvm::raw_ostream &OS)
+  : Rewriter(SM, BufferId, OS) {}
+  void accept(SourceManager &SM, CharSourceRange Range, StringRef Text) {
+    Rewriter.replaceText(SM, Range, Text);
+  }
+};
+
+swift::ide::SourceEditOutputConsumer::
+SourceEditOutputConsumer(SourceManager &SM, unsigned BufferId,
+  llvm::raw_ostream &OS) : Impl(*new Implementation(SM, BufferId, OS)) {}
+
+swift::ide::SourceEditOutputConsumer::~SourceEditOutputConsumer() { delete &Impl; }
+
+void swift::ide::SourceEditOutputConsumer::
+accept(SourceManager &SM, RegionType RegionType,
+       ArrayRef<Replacement> Replacements) {
+  // ignore mismatched or
+  if (RegionType == RegionType::Unmatched || RegionType == RegionType::Mismatch)
+    return;
+
+  for (const auto &Replacement : Replacements) {
+    Impl.accept(SM, Replacement.Range, Replacement.Text);
+  }
+}
+
+bool swift::ide::isFromClang(const Decl *D) {
+  if (getEffectiveClangNode(D))
+    return true;
+  if (auto *Ext = dyn_cast<ExtensionDecl>(D))
+    return static_cast<bool>(extensionGetClangNode(Ext));
+  return false;
+}
+
+ClangNode swift::ide::getEffectiveClangNode(const Decl *decl) {
+  auto &ctx = decl->getASTContext();
+  auto *importer = static_cast<ClangImporter *>(ctx.getClangModuleLoader());
+  return importer->getEffectiveClangNode(decl);
+}
+
+/// Retrieve the Clang node for the given extension, if it has one.
+ClangNode swift::ide::extensionGetClangNode(const ExtensionDecl *ext) {
+  // If it has a Clang node (directly),
+  if (ext->hasClangNode()) return ext->getClangNode();
+
+  // Check whether it was syntheszed into a module-scope context.
+  if (!isa<ClangModuleUnit>(ext->getModuleScopeContext()))
+    return ClangNode();
+
+  // It may have a global imported as a member.
+  for (auto member : ext->getMembers()) {
+    if (auto clangNode = getEffectiveClangNode(member))
+      return clangNode;
+  }
+
+  return ClangNode();
+}
+
+std::pair<Type, ConcreteDeclRef> swift::ide::getReferencedDecl(Expr *expr) {
+  auto exprTy = expr->getType();
+
+  // Look through unbound instance member accesses.
+  if (auto *dotSyntaxExpr = dyn_cast<DotSyntaxBaseIgnoredExpr>(expr))
+    expr = dotSyntaxExpr->getRHS();
+
+  // Look through the 'self' application.
+  if (auto *selfApplyExpr = dyn_cast<SelfApplyExpr>(expr))
+    expr = selfApplyExpr->getFn();
+
+  // Look through curry thunks.
+  if (auto *closure = dyn_cast<AutoClosureExpr>(expr))
+    if (auto *unwrappedThunk = closure->getUnwrappedCurryThunkExpr())
+      expr = unwrappedThunk;
+
+  // If this is an IUO result, unwrap the optional type.
+  auto refDecl = expr->getReferencedDecl();
+  if (!refDecl) {
+    if (auto *applyExpr = dyn_cast<ApplyExpr>(expr)) {
+      auto fnDecl = applyExpr->getFn()->getReferencedDecl();
+      if (auto *func = fnDecl.getDecl()) {
+        if (func->isImplicitlyUnwrappedOptional()) {
+          if (auto objectTy = exprTy->getOptionalObjectType())
+            exprTy = objectTy;
+        }
+      }
+    }
+  }
+
+  return std::make_pair(exprTy, refDecl);
+}

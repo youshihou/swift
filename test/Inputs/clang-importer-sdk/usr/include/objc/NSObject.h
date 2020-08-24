@@ -27,6 +27,10 @@
 @property (readonly) NSInteger hash;
 @end
 
+@interface NSObject (Coding)
+- (Class)classForCoder;
+@end
+
 @interface A : NSObject
 - (int)method:(int)arg withDouble:(double)d;
 + (int)classMethod;
@@ -61,6 +65,7 @@
 - performMultiplyWithValue:(int)x value:(int)y;
 - moveFor:(int)x;
 @property (readonly) int readCounter;
+@property (class) int sharedCounter;
 
 @property int informalMadeFormal;
 

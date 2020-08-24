@@ -1,17 +1,28 @@
-add_swift_library(swiftIDE
+add_swift_host_library(swiftIDE STATIC
   CodeCompletion.cpp
   CodeCompletionCache.cpp
+  CodeCompletionResultPrinter.cpp
   CommentConversion.cpp
+  CompletionInstance.cpp
+  ConformingMethodList.cpp
+  ExprContextAnalysis.cpp
+  Formatting.cpp
+  Refactoring.cpp
   ModuleInterfacePrinting.cpp
   REPLCodeCompletion.cpp
-  SourceEntityWalker.cpp
+  SwiftSourceDocInfo.cpp
   SyntaxModel.cpp
   Utils.cpp
-  SwiftSourceDocInfo.cpp
-  LINK_LIBRARIES
-    swiftFrontend
-    swiftClangImporter
-    swiftParse
-    swiftSema
-    swiftAST)
+  IDETypeChecking.cpp
+  APIDigesterData.cpp
+  SourceEntityWalker.cpp
+  TypeContextInfo.cpp
+  IDERequests.cpp)
+target_link_libraries(swiftIDE PRIVATE
+  swiftAST
+  swiftClangImporter
+  swiftFrontend
+  swiftIndex
+  swiftParse
+  swiftSema)
 
